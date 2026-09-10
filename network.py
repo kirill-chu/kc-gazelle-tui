@@ -542,7 +542,7 @@ def get_vpn_list():
                 name = line.split(':')[0]
                 vpns.append({
                     'name': name,
-                    'active': name == active_vpn
+                    'active': name in active_vpn
                 })
         return sorted(vpns, key=lambda x: (not x['active'], x['name']))
     except:
@@ -557,12 +557,13 @@ def get_active_vpn():
         # VPN types supported by NetworkManager
         vpn_types = [':vpn', ':wireguard', ':vpnc', ':pptp', ':openconnect', ':openvpn']
         
+        active = set()
         for line in result.stdout.strip().split('\n'):
             if any(vpn_type in line for vpn_type in vpn_types):
-                return line.split(':')[0]
-        return None
+                active.add(line.split(':')[0])
+        return active
     except:
-        return None
+        return set()
 
 def connect_vpn(name):
     """Connect to VPN by name"""
