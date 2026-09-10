@@ -454,6 +454,76 @@ def load_omarchy_styles():
         "section_border": border_style,
     }
 
+def load_alacritty_colors(config_dir: Path):
+    """
+    Load colors from Alacritty theme.
+
+    Resolution order:
+      1. 'alacritty_theme_path' in ~/.config/gazelle/config.json (explicit override)
+      2. First import in ~/.config/alacritty/alacritty.toml whose path contains 'theme'
+      3. Default: ~/.config/current_theme/theme.toml
+
+    Returns dict with RGB color values, or None if not found.
+    """
+
+    theme_file = None
+
+    # 1. Explicit path from gazelle config
+    cfg_file = config_dir / "config.json"
+    if cfg_file.exists():
+        try:
+            cfg = json.loads(cfg_file.read_text())
+            path_str = cfg.get("alacritty_theme_path")
+            if path_str:
+                candidate = Path(path_str).expanduser()
+                if candidate.exists():
+                    theme_file = candidate
+        except Exception:
+            pass
+
+    # 2. Parse alacritty.toml imports for first entry containing 'theme'
+    if theme_file is None:
+        alacritty_conf = Path.home() / ".config/alacritty/alacritty.toml"
+        if alacritty_conf.exists():
+            try:
+                with open(alacritty_conf, "rb") as f:
+                    data = tomllib.load(f)
+                for imp in data.get("general", {}).get("import", []):
+                    if "theme" in str(imp).lower():
+                        candidate = Path(str(imp)).expanduser()
+                        if candidate.exists():
+                            theme_file = candidate
+                            break
+            except Exception:
+                pass
+
+    # 3. Default fallback
+    if theme_file is None:
+        candidate = Path.home() / ".config/alacritty/current_theme/theme.toml"
+        if candidate.exists():
+            theme_file = candidate
+
+    if theme_file is None:
+        return None
+
+    try:
+        with open(theme_file, "rb") as f:
+            data = tomllib.load(f)
+
+        colors = data.get("colors", {})
+        normal = colors.get("normal", {})
+        bright = colors.get("bright", {})
+        primary = colors.get("primary", {})
+
+        return {
+            "accent": normalize_color_format(normal.get("yellow") or bright.get("yellow") or "#EBCB8B"),
+            "primary": normalize_color_format(normal.get("red") or bright.get("red") or "#BF616A"),
+            "foreground": normalize_color_format(primary.get("foreground") or "#D8DEE9"),
+            "background": normalize_color_format(primary.get("background") or "#2E3440"),
+        }
+    except Exception:
+        return None
+
 def load_user_colors(config_dir: Path):
     """
     Load colors from user defined theme file.
@@ -564,6 +634,12 @@ def build_css(styles: dict) -> str:
     Horizontal {{ height: auto; margin-top: 1; }}
     Button {{ min-width: {styles['button_min_width']}; }}
 
+    DataTable > .datatable--header {{
+        background: $primary;
+        color: $text;
+        text-style: bold;
+    }}
+    
     /* DataTable selection/cursor colors */
     DataTable > .datatable--cursor {{
         background: $accent {styles['cursor_opacity']};
@@ -681,6 +757,8 @@ class Gazelle(App):
     def on_mount(self) -> None:
         # Try to load Omarchy colors
         omarchy_colors = load_omarchy_colors()
+        # Try to load colors from Alacritty theme
+        alacritty_colors = load_alacritty_colors(self.CONFIG_DIR)
         # Try to load custom theme
         user_colors = load_user_colors(self.CONFIG_DIR)
         if user_colors:
@@ -716,6 +794,21 @@ class Gazelle(App):
             )
             if not user_colors:
                 default_theme = "omarchy-auto"
+
+        elif alacritty_colors:
+            self.register_theme(Theme(
+                name="alacritty-auto",
+                primary=alacritty_colors["primary"],
+                secondary=alacritty_colors["accent"],
+                accent=alacritty_colors["accent"],
+                foreground=alacritty_colors["foreground"],
+                background=alacritty_colors["background"],
+                surface=alacritty_colors["background"],
+                panel=alacritty_colors["background"],
+                dark=True,
+            ))
+            if default_theme is None:
+                default_theme = "alacritty-auto"
         else:
             # Fallback: Use ANSI colors for non-Omarchy users
             self.register_theme(
