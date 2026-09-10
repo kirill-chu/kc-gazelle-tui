@@ -640,7 +640,7 @@ def get_wwan_list():
                 name = line.split(':')[0]
                 wwan_entry = {
                     'name': name,
-                    'active': name == active_wwan
+                    'active': name in active_wwan
                 }
 
                 # Add modem info if connection is active
@@ -665,12 +665,13 @@ def get_active_wwan():
         result = subprocess.run(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show', '--active'],
                                capture_output=True, text=True, check=True)
 
+        active = set()
         for line in result.stdout.strip().split('\n'):
             if ':gsm' in line:
-                return line.split(':')[0]
-        return None
+                active.add(line.split(':')[0])
+        return active
     except:
-        return None
+        return set()
 
 def connect_wwan(name):
     """Connect to WWAN by name"""
