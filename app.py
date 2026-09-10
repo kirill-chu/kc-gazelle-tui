@@ -1,6 +1,7 @@
 """Gazelle - Minimal NetworkManager TUI"""
 import os
 os.environ["RICH_COLOR_SYSTEM"] = "standard"
+from textual import work
 from textual.app import App, ComposeResult
 from textual.theme import Theme
 from textual.widgets import Header, Footer, Static, Input, Button, DataTable, Select
@@ -73,6 +74,7 @@ class HiddenNetworkScreen(ModalScreen):
         """Handle Esc key"""
         self.app.pop_screen()
 
+
 class VPNScreen(ModalScreen):
     """Screen for VPN connection management"""
 
@@ -84,6 +86,10 @@ class VPNScreen(ModalScreen):
         Binding("r", "refresh", "Refresh"),
         Binding("q", "cancel", "Back"),
     ]
+
+    def __init__(self):
+        super().__init__()
+        self._connecting = False
 
     def compose(self) -> ComposeResult:
         yield Container(
@@ -112,24 +118,56 @@ class VPNScreen(ModalScreen):
         self.action_toggle_vpn()
 
     def action_toggle_vpn(self) -> None:
-        """Toggle VPN connection on Space/Enter key"""
+        """Toggle VPN connection. Connect dispatches to a worker."""
+        if self._connecting:
+            self.notify("Already connecting…")
+            return
+
         table = self.query_one("#vpn-table", DataTable)
-        if table.cursor_row >= 0 and table.cursor_row < table.row_count:
-            row = table.get_row_at(table.cursor_row)
-            status, name = str(row[0]), str(row[1])
+        if table.cursor_row < 0 or table.cursor_row >= table.row_count:
+            return
 
-            if status == "🟢":
-                # Disconnect
-                self.notify("Disconnecting...")
-                success = disconnect_vpn(name)
-                self.notify("✓ Disconnected" if success else "✗ Failed")
-            else:
-                # Connect
-                self.notify("Connecting...")
-                success, msg = connect_vpn(name)
-                self.notify("✓ Connected" if success else "✗ Failed")
+        row = table.get_row_at(table.cursor_row)
+        status, name = str(row[0]), str(row[1])
 
+        if status == "🟢":
+            # Disconnect — no prompts, do it inline
+            self.notify("Disconnecting…")
+            success = disconnect_vpn(name)
+            self.notify("✓ Disconnected" if success else "✗ Failed")
             self.refresh_vpn_list()
+            return
+
+        # Connect — must run in a worker so push_screen_wait works
+        self._connecting = True
+        self._connect_vpn_worker(name)
+
+    @work
+    async def _connect_vpn_worker(self, name: str) -> None:
+        """Async VPN connect flow. Runs in a worker.
+
+        `push_screen_wait` inside `on_prompt` is only legal from a worker,
+        hence this separation from the action handler.
+        """
+        self.notify(f"Connecting to {name}…")
+        try:
+            async def on_prompt(block_text, kind, last_line, options):
+                return await self.app.push_screen_wait(
+                    VPNPromptScreen(block_text, kind, last_line, options)
+                )
+
+            connector = VPNConnector()
+            success, msg = await connector.connect(name, on_prompt)
+        except Exception as e:
+            success, msg = False, f"Error: {e}"
+        finally:
+            self._connecting = False
+
+        if success:
+            self.notify("✓ Connected")
+        else:
+            self.notify(f"✗ {msg}", timeout=8)
+        self.refresh_vpn_list()
 
     def action_cursor_down(self) -> None:
         """Move cursor down"""
@@ -357,6 +395,97 @@ class PasswordScreen(ModalScreen):
     def action_cancel(self) -> None:
         """Handle Esc key"""
         self.app.pop_screen()
+
+# Lines starting with these prefixes are technical noise from the VPN
+# server and get filtered out when displaying a prompt block to the user.
+_VPN_NOISE_PREFIXES = (
+    'POST ', 'GET ', 'PUT ', 'DELETE ',
+    'Connected to ', 'SSL negotiation with ',
+    'XML POST enabled',
+    'Got HTTP response',
+    'Unexpected ',
+)
+
+
+def _clean_vpn_block(block_text: str) -> str:
+    """Strip technical noise, keep human-readable lines."""
+    lines = []
+    for line in block_text.split('\n'):
+        if any(line.lstrip().startswith(p) for p in _VPN_NOISE_PREFIXES):
+            continue
+        lines.append(line)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return '\n'.join(lines)
+
+
+class VPNPromptScreen(ModalScreen):
+    """Modal collecting a single answer to an nmcli prompt.
+
+    Returns the entered string via dismiss(), or None to cancel.
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, block_text: str, kind: str, last_line: str, options: list):
+        super().__init__()
+        self.block_text = block_text
+        self.kind = kind
+        self.last_line = last_line
+        self.options = options or []
+
+    def compose(self) -> ComposeResult:
+        display = _clean_vpn_block(self.block_text).strip()
+        if not display:
+            display = self.last_line
+
+        with Container(id="vpn-prompt-dialog"):
+            with ScrollableContainer(id="vpn-prompt-scroll"):
+                yield Static(display, id="vpn-prompt-block")
+
+
+            if self.kind == 'group' and self.options:
+                yield Select(
+                    [(opt, opt) for opt in self.options],
+                    value=self.options[0],
+                    id="vpn-prompt-input",
+                )
+            elif self.kind == 'password':
+                yield Input(password=True, id="vpn-prompt-input")
+            else:
+                yield Input(id="vpn-prompt-input")
+
+            with Horizontal(id="vpn-prompt-buttons"):
+              yield Button("OK", variant="primary", id="ok")
+              yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        widget = self.query_one("#vpn-prompt-input")
+        widget.focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        elif event.button.id == "ok":
+            self._submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        widget = self.query_one("#vpn-prompt-input")
+        value = getattr(widget, "value", "")
+        if value is None:
+            value = ""
+        self.dismiss(str(value))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 def load_omarchy_colors():
     """
@@ -625,12 +754,31 @@ def build_css(styles: dict) -> str:
     PasswordScreen, HiddenNetworkScreen, Wired8021xScreen {{ align: center middle; }}
     #dialog {{ width: {styles['dialog_width']}; height: auto; border: {styles['dialog_border']} $accent; background: $background; padding: {styles['dialog_padding']}; }}
     #title {{ text-style: {styles['title_text_style']}; color: $accent; margin-bottom: 1; }}
+    VPNPromptScreen {{ align: center middle; }}
+    #vpn-prompt-dialog {{
+        width: 80%;
+        height: auto;
+        max-height: 80%;
+        border: {styles['dialog_border']} $accent;
+        background: $background;
+        padding: {styles['dialog_padding']};
+    }}
+    #vpn-prompt-scroll {{
+        height: auto;
+        max-height: 20;
+        margin-bottom: 1;
+        border: none;
+        background: transparent;
+        padding: 0;
+    }}
+    #vpn-prompt-input {{ margin-bottom: 1; }}
+    #vpn-prompt-buttons {{ margin-top: 0; }}
     .section {{ border: {styles['section_border']} $accent; margin: {styles['section_margin']}; padding: {styles['section_padding']}; }}
     .section-title {{ text-style: {styles['section_title_text_style']}; color: $accent; background: $background; padding: {styles['section_title_padding']}; }}
     #device-section, #station-section {{ height: {styles['info_section_height']}; }}
     Static {{ height: auto; }}
     Input {{ height: {styles['input_height']}; margin-bottom: 1; }}
-    Select {{ height: {styles['input_height']}; margin-bottom: 1; }}
+    Select {{ margin-bottom: 1; }}
     Horizontal {{ height: auto; margin-top: 1; }}
     Button {{ min-width: {styles['button_min_width']}; }}
 

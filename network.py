@@ -1,4 +1,9 @@
 """NetworkManager interface"""
+import asyncio
+import os
+import pty
+import re
+import shutil
 import subprocess
 import sys
 
@@ -316,6 +321,209 @@ def is_enterprise(security):
 def is_owe(security):
     """Check if network uses OWE (Enhanced Open / WPA3-OWE)"""
     return 'OWE' in security or 'WPA3-OWE' in security
+
+# ---------------------------------------------------------------------------
+# VPN connector: async wrapper around `nmcli connection up <name> --ask`
+# ---------------------------------------------------------------------------
+
+_ANSI_RE = re.compile(rb'\x1b\[[0-9;?]*[A-Za-z]')
+
+
+def _strip_ansi(data: bytes) -> bytes:
+    return _ANSI_RE.sub(b'', data)
+
+
+def _classify_prompt(last_line: str) -> str:
+    """Best-effort classification of a prompt line (used by UI to pick widget)."""
+    low = last_line.lower()
+    if 'group' in low and '[' in low and ']' in low:
+        return 'group'
+    if 'password' in low or 'пароль' in low:
+        return 'password'
+    if 'username' in low or 'login' in low or 'user:' in low:
+        return 'username'
+    if 'response' in low:
+        return 'response'
+    return 'generic'
+
+
+def _detect_prompt(buf: bytes):
+    """Return (end_pos, kind, last_line) if buf's last non-empty line ends with ':'.
+
+    Structural rule only — idle-state is guaranteed by the caller.
+    """
+    nl = buf.rfind(b'\n')
+    tail = buf[nl + 1:] if nl != -1 else buf
+    tail_start = nl + 1
+
+    stripped = tail.rstrip(b' \t\r')
+    if not stripped or not stripped.endswith(b':'):
+        return None, None, None
+
+    pos = tail_start + len(stripped)
+    try:
+        last_line = stripped.decode('utf-8', errors='replace')
+    except Exception:
+        last_line = repr(stripped)
+    return pos, _classify_prompt(last_line), last_line
+
+
+def _extract_group_options(last_line: str):
+    m = re.search(r'\[([^\]]+)\]', last_line)
+    if not m:
+        return []
+    return [opt.strip() for opt in m.group(1).split('|') if opt.strip()]
+
+class VPNConnector:
+    """Async wrapper around `nmcli connection up <name> --ask` via PTY.
+
+    Each prompt is delegated to an async callback supplied by the caller:
+
+        async def on_prompt(block_text, kind, last_line, options) -> str | None:
+            # return answer string, or None to cancel
+
+        connector = VPNConnector()
+        ok, msg = await connector.connect("M1", on_prompt)
+    """
+
+    IDLE_TIMEOUT = 0.3        # seconds of silence => prompt is ready
+    PROMPT_TIMEOUT = 300.0    # seconds to wait for the user's answer
+    OVERALL_TIMEOUT = 900.0   # seconds for the whole operation
+
+    async def connect(self, name, on_prompt):
+        if not shutil.which('nmcli'):
+            return False, "nmcli not found in PATH"
+
+        try:
+            master_fd, slave_fd = pty.openpty()
+        except OSError as e:
+            return False, f"Failed to open PTY: {e}"
+
+        env = os.environ.copy()
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'nmcli', 'connection', 'up', name, '--ask',
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                env=env,
+            )
+        except Exception as e:
+            os.close(master_fd)
+            os.close(slave_fd)
+            return False, f"Failed to spawn nmcli: {e}"
+
+        os.close(slave_fd)
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def on_readable():
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                data = b''
+            queue.put_nowait(data)
+
+        loop.add_reader(master_fd, on_readable)
+
+        clean_buf = b''
+        last_answered_offset = 0
+        answered_positions = set()
+        cancelled = False
+
+        try:
+            overall_deadline = loop.time() + self.OVERALL_TIMEOUT
+
+            while True:
+                if loop.time() > overall_deadline:
+                    cancelled = True
+                    return False, "Operation timed out"
+
+                try:
+                    chunk = await asyncio.wait_for(
+                        queue.get(), timeout=self.IDLE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    chunk = None
+
+                if chunk == b'':
+                    break  # EOF
+                if chunk is not None:
+                    clean_buf += _strip_ansi(chunk)
+                    continue
+
+                pos, kind, last_line = _detect_prompt(clean_buf)
+                if pos is None or pos in answered_positions:
+                    continue
+
+                answered_positions.add(pos)
+                block = clean_buf[last_answered_offset:pos]
+                block_text = block.decode('utf-8', errors='replace')
+                options = _extract_group_options(last_line) if kind == 'group' else []
+
+                try:
+                    answer = await asyncio.wait_for(
+                        on_prompt(block_text, kind, last_line, options),
+                        timeout=self.PROMPT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    cancelled = True
+                    break
+                except Exception as e:
+                    cancelled = True
+                    return False, f"Prompt handler failed: {e}"
+
+                if answer is None:
+                    cancelled = True
+                    break
+
+                os.write(master_fd, (answer + '\n').encode('utf-8'))
+                last_answered_offset = pos
+
+            if cancelled:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                return False, "Cancelled"
+
+            rc = await proc.wait()
+            tail_text = clean_buf[last_answered_offset:].decode(
+                'utf-8', errors='replace'
+            ).strip()
+
+            if rc == 0:
+                return True, "Connected"
+            return False, self._extract_error(tail_text) or f"nmcli exit {rc}"
+
+        finally:
+            loop.remove_reader(master_fd)
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    proc.kill()
+
+    @staticmethod
+    def _extract_error(text: str) -> str:
+        for line in reversed(text.split('\n')):
+            s = line.strip()
+            if s.startswith('Error:'):
+                return s
+        for line in reversed(text.split('\n')):
+            s = line.strip()
+            if s:
+                return s
+        return ""
+
+
+# ---------------------------------------------------------------------------
 
 def get_vpn_list():
     """Get all VPN connections configured in NetworkManager"""
