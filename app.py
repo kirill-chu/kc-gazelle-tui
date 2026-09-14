@@ -782,6 +782,10 @@ def build_css(styles: dict) -> str:
     Horizontal {{ height: auto; margin-top: 1; }}
     Button {{ min-width: {styles['button_min_width']}; }}
 
+    DataTable {{ max-height: 50;}}
+    #known-section, #new-section {{ height: 1fr; }}
+    #known, #new {{ height: 1fr; }}
+    
     DataTable > .datatable--header {{
         background: $primary;
         color: $text;
@@ -890,16 +894,14 @@ class Gazelle(App):
     
     def compose(self) -> ComposeResult:
         yield Header()
-        yield ScrollableContainer(
-            Container(Static("Device", classes="section-title"), 
-                     DataTable(id="dev"), classes="section", id="device-section"),
-            Container(Static("Station", classes="section-title"),
-                     DataTable(id="sta"), classes="section", id="station-section"),
-            Container(Static("Known Networks", classes="section-title"),
-                     DataTable(id="known", cursor_type="row"), classes="section"),
-            Container(Static("New Networks", classes="section-title"),
-                     DataTable(id="new", cursor_type="row"), classes="section"),
-        )
+        yield Container(Static("Device", classes="section-title"), 
+                    DataTable(id="dev"), classes="section", id="device-section")
+        yield Container(Static("Station", classes="section-title"),
+                    DataTable(id="sta"), classes="section", id="station-section")
+        yield Container(Static("Known Networks", classes="section-title"),
+                    DataTable(id="known", cursor_type="row"), classes="section", id="known-section")
+        yield Container(Static("New Networks", classes="section-title"),
+                    DataTable(id="new", cursor_type="row"), classes="section", id="new-section")
         yield Footer()
     
     def on_mount(self) -> None:
